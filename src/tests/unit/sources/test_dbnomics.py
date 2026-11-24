@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 import pytest
+import requests
 
 from helpers import constants
 from helpers import dbnomics as dbnomics_helper
@@ -34,6 +35,9 @@ _TEST_QUESTIONS = [
 ]
 _RAW_ID = "meteofrance/TEMPERATURE/celsius.07005.D"
 _SAFE_ID = "meteofrance_TEMPERATURE_celsius.07005.D"
+_ECB_ID = "ECB/CISS/D.U2.Z0Z.4F.EC.SS_FXN.CON"
+_ECB_KEY = _ECB_ID.removeprefix("ECB/").replace("/", ".")
+_ECB_QUESTION = next(row for row in DBNOMICS_QUESTIONS if row["id"] == _ECB_ID)
 
 
 def _empty_dfq():
@@ -218,6 +222,125 @@ class TestFetch:
                 RuntimeError, match="No DBnomics series returned usable observations"
             ):
                 dbnomics_source.fetch()
+
+
+# ---------------------------------------------------------------------------
+# ECB fallback
+# ---------------------------------------------------------------------------
+
+
+@patch("sources.dbnomics.DBNOMICS_QUESTIONS", [_ECB_QUESTION])
+class TestEcbFallback:
+    def test_yesterdays_zero_is_a_fresh_observation(self, dbnomics_source, freeze_today):
+        freeze_today(date(2026, 11, 24))
+        mirror = Mock(json=lambda: make_dbnomics_api_response([("2026-11-23", 0)], "ECB"))
+        with patch("sources.dbnomics.requests.get", side_effect=[mirror]):
+            fetched = dbnomics_source.fetch()
+        assert fetched.set_index("period")["value"].to_dict() == {"2026-11-23": 0}
+
+    @pytest.mark.parametrize("mirror_state", ["two days old", "all missing", "empty", "timeout"])
+    def test_publisher_replaces_the_full_series(self, dbnomics_source, freeze_today, mirror_state):
+        freeze_today(date(2026, 11, 24))
+        mirror_rows = {
+            "two days old": [("2026-11-21", 1), ("2026-11-22", 2), ("2026-11-23", "NA")],
+            "all missing": [("2026-11-23", "NA")],
+        }
+        published = {"2026-10-22": 4.5, "2026-11-22": 2.5, "2026-11-23": 0.0}
+
+        def get(url, params, **kwargs):
+            if url.endswith(_ECB_ID):
+                if mirror_state == "timeout":
+                    raise requests.Timeout()
+                if mirror_state == "empty":
+                    return Mock(json=lambda: {"series": {"docs": []}})
+                return Mock(
+                    json=lambda: make_dbnomics_api_response(mirror_rows[mirror_state], "ECB")
+                )
+            assert url.endswith("/CISS/" + _ECB_ID.split("/")[-1])
+            rows = [
+                f"{_ECB_KEY},{day},{value}"
+                for day, value in published.items()
+                if params["startPeriod"] <= day <= params["endPeriod"]
+            ]
+            return Mock(status_code=200, text="KEY,TIME_PERIOD,OBS_VALUE\n" + "\n".join(rows))
+
+        with patch("sources.dbnomics.requests.get", side_effect=get):
+            fetched = dbnomics_source.fetch()
+        safe_id = _ECB_ID.replace("/", "_")
+        assert set(fetched["id"]) == {safe_id}
+        assert fetched.set_index("period")["value"].to_dict() == published
+        result = dbnomics_source.update(_empty_dfq(), fetched)
+        assert result.dfq["id"].tolist() == [safe_id]
+        assert float(result.dfq.iloc[0]["freeze_datetime_value"]) == 0.0
+        history = result.resolution_files[safe_id].set_index("date")["value"]
+        assert float(history.at["2026-11-22"]) == 2.5
+
+    @pytest.mark.parametrize("key,day", [(_ECB_KEY, "2026-11-18"), ("CISS.other", "2026-11-23")])
+    def test_publisher_must_supply_the_requested_series_and_not_regress(
+        self, dbnomics_source, freeze_today, key, day
+    ):
+        freeze_today(date(2026, 11, 24))
+        mirror = Mock(json=lambda: make_dbnomics_api_response([("2026-11-22", 2.0)], "ECB"))
+        publisher = Mock(status_code=200, text=f"KEY,TIME_PERIOD,OBS_VALUE\n{key},{day},30")
+        with patch("sources.dbnomics.requests.get", side_effect=[mirror, publisher]):
+            fetched = dbnomics_source.fetch()
+        assert fetched.set_index("period")["value"].to_dict() == {"2026-11-22": 2.0}
+
+
+@pytest.mark.parametrize("exchange_rate_recovers", [True, False], ids=["partial", "total"])
+def test_publisher_outage_retries_then_keeps_tonights_mirror_and_continues(
+    dbnomics_source, freeze_today, local_bucket, exchange_rate_recovers
+):
+    from orchestration.func_dbnomics_fetch.main import driver as fetch
+
+    freeze_today(date(2026, 11, 24))
+    safe_id = _ECB_ID.replace("/", "_")
+    other = next(row for row in DBNOMICS_QUESTIONS if row["id"] == "ECB/EXR/D.USD.EUR.SP00.A")
+    other_safe_id = other["id"].replace("/", "_")
+    local_bucket.seed_fetch(
+        "dbnomics",
+        make_dbnomics_fetch_df([{"id": safe_id, "period": "2026-11-20", "value": 3.0}]).to_dict(
+            "records"
+        ),
+    )
+    publisher_calls = Counter()
+    unavailable = requests.Response()
+    unavailable.status_code = 503
+
+    def get(url, **kwargs):
+        if "api.db.nomics.world" in url:
+            provider = "meteofrance" if url.endswith(_RAW_ID) else "ECB"
+            return Mock(json=lambda: make_dbnomics_api_response([("2026-11-14", 1.0)], provider))
+        publisher_calls[url] += 1
+        if url.endswith("/" + _ECB_ID.removeprefix("ECB/")):
+            return unavailable
+        assert url.endswith("/EXR/D.USD.EUR.SP00.A")
+        if publisher_calls[url] == 1:
+            raise requests.Timeout()
+        if not exchange_rate_recovers:
+            return unavailable
+        return Mock(
+            status_code=200, text="KEY,TIME_PERIOD,OBS_VALUE\nEXR.D.USD.EUR.SP00.A,2026-11-23,2.0"
+        )
+
+    with (
+        patch("sources.dbnomics.DBNOMICS_QUESTIONS", [_ECB_QUESTION, other, *_TEST_QUESTIONS]),
+        patch("sources.dbnomics.requests.get", side_effect=get),
+        patch("time.sleep"),
+    ):
+        fetch(None)
+        saved = local_bucket.read_fetch("dbnomics")
+        other_date, other_value = (
+            ("2026-11-23", 2.0) if exchange_rate_recovers else ("2026-11-14", 1.0)
+        )
+        assert saved.set_index(["id", "period"])["value"].to_dict() == {
+            (safe_id, "2026-11-14"): 1.0,
+            (other_safe_id, other_date): other_value,
+            (_SAFE_ID, "2026-11-14"): 1.0,
+        }
+        assert sorted(publisher_calls.values()) == ([2, 3] if exchange_rate_recovers else [3, 3])
+        result = dbnomics_source.update(_empty_dfq(), saved)
+        assert set(result.dfq["id"]) == {safe_id, other_safe_id, _SAFE_ID}
 
 
 # ---------------------------------------------------------------------------

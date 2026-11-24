@@ -16,6 +16,21 @@ pytestmark = pytest.mark.live
 _HTTP_TIMEOUT = 30
 
 
+@pytest.mark.parametrize("dataset", ["CISS", "EST", "EXR", "FM", "ILM", "YC"])
+def test_ecb_publisher_contract(dataset, monkeypatch, freeze_today):
+    """The publisher returns real, dated observations for each configured ECB dataset."""
+    from sources.dbnomics import DBNOMICS_QUESTIONS, DbnomicsSource
+
+    row = next(r for r in DBNOMICS_QUESTIONS if r["id"].startswith(f"ECB/{dataset}/"))
+    monkeypatch.setattr("sources.dbnomics.DBNOMICS_QUESTIONS", [row])
+    monkeypatch.setattr(DbnomicsSource, "_call_endpoint", lambda *args, **kwargs: None)
+    freeze_today(date(2026, 10, 30))
+    data = DbnomicsSource().fetch()
+    assert set(data["id"]) == {row["id"].replace("/", "_")}
+    completed_week = data["period"].between("2026-10-22", "2026-10-29")
+    assert data.loc[completed_week, "value"].ne("NA").any()
+
+
 def _resolve_secret_or_skip(attr_name: str) -> str:
     """Resolve a credential via ``helpers.keys``, or ``pytest.skip`` when it is unavailable.
 

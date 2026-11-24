@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
+from functools import partial
+from io import StringIO
 from typing import Any, ClassVar
 
 import backoff
+import numpy as np
 import pandas as pd
 import pandera.pandas as pa
 import requests
@@ -35,6 +39,7 @@ _OBSERVATIONS_WITHOUT_DATA = 10
 
 # Allow a weekly observation plus three days for publication/ingestion delays.
 MAX_OBSERVATION_AGE_DAYS = 10
+_ECB_MAX_ATTEMPTS = 3
 
 _QUESTION_TEMPLATES = {
     "meteofrance": (
@@ -102,6 +107,8 @@ def _create_ecb_questions(series: list[dict[str, str]]) -> list[dict]:
         questions.append(
             {
                 "id": item["id"],
+                "dataset_name": item["dataset_name"],
+                "series_name": item["question_subject"],
                 "question_text": question_text,
                 "freeze_datetime_value_explanation": explanation,
                 "fill_missing_dates": True,
@@ -113,6 +120,14 @@ def _create_ecb_questions(series: list[dict[str, str]]) -> list[dict]:
 DBNOMICS_QUESTIONS = _create_meteofrance_questions(METEOFRANCE_STATIONS) + _create_ecb_questions(
     ECB_QUESTIONS
 )
+
+
+def _latest_observation(frame: pd.DataFrame | None) -> date | None:
+    """Return the latest date with a real observation, before any forward fill."""
+    if frame is None:
+        return None
+    periods = frame.loc[frame["value"].notna() & frame["value"].ne("NA"), "period"]
+    return periods.max() if not periods.empty else None
 
 
 class DbnomicsSource(DatasetSource):
@@ -139,10 +154,18 @@ class DbnomicsSource(DatasetSource):
         logger.info("Downloading DBnomics data.")
 
         frames = []
+        ecb_questions = []
         for row in DBNOMICS_QUESTIONS:
+            if row["id"].startswith("ECB/"):
+                ecb_questions.append(row)
+                continue
             new_rows = self._call_endpoint(id=row["id"], today=today)
             if new_rows is not None:
                 frames.append(new_rows)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = pool.map(partial(self._fetch_ecb_question, today=today), ecb_questions)
+            frames.extend(frame for frame in results if frame is not None)
 
         if not frames:
             raise RuntimeError("No DBnomics series returned usable observations.")
@@ -280,13 +303,84 @@ class DbnomicsSource(DatasetSource):
     # Private: API calls
     # ------------------------------------------------------------------
 
+    def _fetch_ecb_question(self, row: dict, today: date) -> pd.DataFrame | None:
+        """Use the publisher's full series when the mirror has no observation from yesterday."""
+        try:
+            mirror = self._call_endpoint(id=row["id"], today=today)
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
+            logger.warning(f"Unusable DBnomics series {row['id']}: {exc}")
+            mirror = None
+        if mirror is not None:
+            mirror = mirror.fillna(
+                {"dataset_name": row["dataset_name"], "series_name": row["series_name"]}
+            )
+
+        latest = _latest_observation(mirror)
+        if latest is not None and latest >= today - timedelta(days=1):
+            return mirror
+
+        try:
+            publisher = self._fetch_ecb_series(row, today)
+        except (requests.RequestException, ValueError) as exc:
+            logger.warning(f"ECB fallback failed for {row['id']}: {exc}")
+            return mirror
+        publisher_latest = _latest_observation(publisher)
+        if publisher_latest is not None and (latest is None or publisher_latest >= latest):
+            return publisher
+        return mirror
+
+    @backoff.on_exception(backoff.expo, requests.RequestException, max_tries=_ECB_MAX_ATTEMPTS)
+    def _fetch_ecb_series(self, row: dict, today: date) -> pd.DataFrame | None:
+        """Fetch one exact ECB series for ForecastBench's retained observation window."""
+        _, dataset, key = row["id"].split("/")
+        start = constants.QUESTION_BANK_DATA_STORAGE_START_DATE
+        response = requests.get(
+            f"https://data-api.ecb.europa.eu/service/data/{dataset}/{key}",
+            params={
+                "startPeriod": start.isoformat(),
+                "endPeriod": (today - timedelta(days=1)).isoformat(),
+                "format": "csvdata",
+                "detail": "dataonly",
+            },
+            timeout=(3, 10),
+        )
+        if response.status_code == 204 or (
+            400 <= response.status_code < 500 and response.status_code not in (408, 429)
+        ):
+            logger.info(f"No ECB data for {row['id']} (HTTP {response.status_code})")
+            return None
+        response.raise_for_status()
+        data = pd.read_csv(
+            StringIO(response.text), usecols=["KEY", "TIME_PERIOD", "OBS_VALUE"], dtype=str
+        )
+        data = data.loc[data["KEY"] == f"{dataset}.{key}"].copy()
+        if data.empty:
+            return None
+        data["period"] = pd.to_datetime(data["TIME_PERIOD"], format="%Y-%m-%d").dt.date
+        data = data.loc[data["period"].between(start, today, inclusive="left")]
+        if data["period"].duplicated().any():
+            raise ValueError("duplicate observation dates")
+        values = data["OBS_VALUE"].astype(float)
+        if np.isinf(values).any():
+            raise ValueError("non-finite ECB observation")
+        return pd.DataFrame(
+            {
+                "id": row["id"].replace("/", "_"),
+                "period": data["period"],
+                "value": values.astype(object).where(values.notna(), "NA"),
+                "provider_name": _PROVIDER_NAMES["ECB"],
+                "dataset_name": row["dataset_name"],
+                "series_name": row["series_name"],
+            }
+        )
+
     @backoff.on_exception(
         backoff.expo,
         requests.exceptions.RequestException,
         max_time=300,
         on_backoff=data_utils.print_error_info_handler,
     )
-    def _call_endpoint(self, id: str, today) -> pd.DataFrame | None:
+    def _call_endpoint(self, id: str, today: date) -> pd.DataFrame | None:
         """Fetch a single DBnomics series and return its observation rows (or None if empty).
 
         Args:
@@ -298,12 +392,29 @@ class DbnomicsSource(DatasetSource):
         # metadata=0 omits large provider and dataset metadata objects that would otherwise bloat
         # every response; the series document still contains the compact labels used below.
         params = {"observations": 1, "metadata": 0}
-        response = requests.get(url=endpoint, params=params, timeout=(10, 60))
-        if not response.ok:
-            logger.error("Request to DBnomics API endpoint failed.")
+        is_ecb = id.startswith("ECB/")
+        try:
+            response = requests.get(url=endpoint, params=params, timeout=(10, 60))
             response.raise_for_status()
-        data = response.json()
+            data = response.json()
+        except requests.RequestException as exc:
+            if is_ecb:
+                logger.warning(f"DBnomics request failed for {id}, trying the ECB: {exc}")
+                return None
+            if isinstance(exc, requests.HTTPError):
+                logger.error("Request to DBnomics API endpoint failed.")
+            raise
         docs = data.get("series", {}).get("docs", [{}])[0]
+        if is_ecb:
+            _, dataset, key = id.split("/")
+            if (
+                docs.get("provider_code") != "ECB"
+                or docs.get("dataset_code", dataset) != dataset
+                or docs.get("series_code", key) != key
+                or not isinstance(docs.get("period"), list)
+                or not isinstance(docs.get("value"), list)
+            ):
+                return None
         id_safe = id.replace("/", "_")
         df = pd.DataFrame(
             {
@@ -316,11 +427,16 @@ class DbnomicsSource(DatasetSource):
             }
         )
         df["period"] = pd.to_datetime(df["period"]).dt.date
+        if is_ecb:
+            numeric = pd.to_numeric(df["value"], errors="coerce")
+            df["value"] = df["value"].where(np.isfinite(numeric), "NA")
         # Filter to record start date and beyond.
         df = df[
             (df["period"] >= constants.QUESTION_BANK_DATA_STORAGE_START_DATE)
             & (df["period"] < today)
         ].reset_index(drop=True)
+        if is_ecb and df["period"].duplicated().any():
+            raise ValueError("duplicate DBnomics observation dates")
         return df if not df.empty else None
 
     # ------------------------------------------------------------------
